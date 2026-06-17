@@ -2,10 +2,20 @@ from datetime import datetime
 from decimal import Decimal
 
 from fastapi import HTTPException
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import models
 from app.utils import new_number, today_text
+
+
+def is_sqlite(db: Session) -> bool:
+    return db.bind is not None and db.bind.dialect.name == "sqlite"
+
+
+def next_id(db: Session, model, pk_name: str) -> int:
+    current = db.scalar(select(func.max(getattr(model, pk_name)))) or 0
+    return int(current) + 1
 
 
 def get_account(db: Session, account_id: int) -> models.Account:
@@ -18,14 +28,15 @@ def get_account(db: Session, account_id: int) -> models.Account:
 
 
 def create_contract_with_account(db: Session, payload: dict) -> models.Contract:
-    product = db.get(models.Product, payload["product_id"])
+    product = db.get(models.BankingProduct, payload["banking_product_id"])
     if not product:
-        raise HTTPException(status_code=404, detail="product not found")
+        raise HTTPException(status_code=404, detail="banking_product not found")
 
     contract = models.Contract(
+        contract_id=payload.get("contract_id") or (next_id(db, models.Contract, "contract_id") if is_sqlite(db) else None),
         contract_number=payload.get("contract_number") or new_number("CTR"),
         customer_id=payload["customer_id"],
-        product_id=product.product_id,
+        banking_product_id=product.banking_product_id,
         contract_interest_rate=payload.get("contract_interest_rate", product.base_interest_rate),
         total_preferential_rate=payload.get("total_preferential_rate", 0),
         final_interest_rate=payload.get("final_interest_rate", product.base_interest_rate),
@@ -38,11 +49,11 @@ def create_contract_with_account(db: Session, payload: dict) -> models.Contract:
         join_channel=payload.get("join_channel", models.JoinChannel.WEB),
         branch_id=payload.get("branch_id"),
         manager_id=payload.get("manager_id"),
-        is_auto_renewal=payload.get("is_auto_renewal", False),
-        auto_transfer_enabled=payload.get("auto_transfer_enabled", False),
+        is_auto_renewal=payload.get("is_auto_renewal", "N"),
+        auto_transfer_enabled=payload.get("auto_transfer_enabled", "N"),
         auto_transfer_day=payload.get("auto_transfer_day"),
-        is_proxy_joined=payload.get("is_proxy_joined", False),
-        is_power_of_attorney_verified=payload.get("is_power_of_attorney_verified", False),
+        is_proxy_joined=payload.get("is_proxy_joined", "N"),
+        is_power_of_attorney_verified=payload.get("is_power_of_attorney_verified", "N"),
         power_of_attorney_file_url=payload.get("power_of_attorney_file_url"),
         terms_file_url=payload.get("terms_file_url"),
         contract_file_url=payload.get("contract_file_url"),
@@ -51,10 +62,11 @@ def create_contract_with_account(db: Session, payload: dict) -> models.Contract:
     db.flush()
 
     account = models.Account(
+        account_id=payload.get("account_id") or (next_id(db, models.Account, "account_id") if is_sqlite(db) else None),
         account_number=payload.get("account_number") or new_number("ACC"),
         customer_id=contract.customer_id,
         contract_id=contract.contract_id,
-        account_type=product.product_type,
+        account_type=product.deposit_product_type,
         saving_type=payload.get("saving_type"),
         balance=payload.get("initial_balance", 0),
         opened_at=contract.started_at,
@@ -76,6 +88,7 @@ def record_transaction(db: Session, account: models.Account, payload: dict, *, t
     account.last_transaction_at = datetime.utcnow()
 
     tx = models.Transaction(
+        transaction_id=payload.get("transaction_id") or (next_id(db, models.Transaction, "transaction_id") if is_sqlite(db) else None),
         transaction_number=payload.get("transaction_number") or new_number("TXN"),
         account_id=account.account_id,
         contract_id=payload.get("contract_id"),
@@ -193,19 +206,36 @@ def reverse_transaction(db: Session, transaction_id: int, payload: dict) -> mode
 
 def pay_interest(db: Session, payload: dict) -> models.InterestHistory:
     account = get_account(db, payload["account_id"])
-    interest_after_tax = Decimal(str(payload["interest_after_tax"]))
+    contract_id = payload.get("contract_id") or account.contract_id
+    interest_amount = payload.get("interest_amount", payload.get("interest_after_tax"))
+    if interest_amount is None:
+        raise HTTPException(status_code=400, detail="interest_amount is required")
+    interest_after_tax = Decimal(str(interest_amount))
+    history_payload = {
+        "contract_id": contract_id,
+        "account_id": account.account_id,
+        "applied_interest_rate": payload.get("applied_interest_rate", payload.get("interest_rate", 0)),
+        "interest_before_tax": payload.get("interest_before_tax", interest_after_tax),
+        "interest_tax_amount": payload.get("interest_tax_amount", 0),
+        "local_income_tax_amount": payload.get("local_income_tax_amount", 0),
+        "interest_after_tax": payload.get("interest_after_tax", interest_after_tax),
+        "interest_reason": payload.get("interest_reason", "REGULAR_INTEREST"),
+    }
     before = Decimal(account.balance)
     account.balance = before + interest_after_tax
     account.total_interest_amount = Decimal(account.total_interest_amount) + interest_after_tax
     account.last_interest_paid_at = datetime.utcnow()
-    history = models.InterestHistory(**payload)
+    history = models.InterestHistory(**history_payload)
+    if is_sqlite(db) and not getattr(history, "interest_id", None):
+        history.interest_id = next_id(db, models.InterestHistory, "interest_id")
     db.add(history)
     db.flush()
     db.add(
         models.Transaction(
+            transaction_id=next_id(db, models.Transaction, "transaction_id") if is_sqlite(db) else None,
             transaction_number=new_number("INT"),
             account_id=account.account_id,
-            contract_id=payload["contract_id"],
+            contract_id=contract_id,
             transaction_type=models.TransactionType.INTEREST,
             direction_type=models.DirectionType.IN,
             amount=interest_after_tax,
